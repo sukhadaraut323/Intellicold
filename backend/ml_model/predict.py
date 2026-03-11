@@ -1,22 +1,8 @@
 """
-IntelliCold - ABSOLUTE FINAL Prediction Module
+IntelliCold - FINAL CORRECT Prediction Module
 
-SCALER expects 20 features:
-1-17: Basic features + derived features
-18. spoilage_rate_per_hr  
-19. spoilage_probability
-20. remaining_shelf_life_hours
-
-PLUS during training, these were added but later dropped:
-- action_encoded (placeholder for prediction)
-- risk_encoded (placeholder for prediction)
-
-The scaler was fitted on data that had action_encoded and risk_encoded!
-We must generate them (as 0) for the scaler, then drop them for the model.
-
-MODEL expects 21 features:
-- Same 20 as scaler BUT without action_encoded and risk_encoded
-- Plus temp_danger_flag at position 18
+SCALER: 23 features (including spoilage_probability, remaining_shelf_life_hours, risk_encoded, action_encoded)
+RISK MODEL: 20 features (NO spoilage/shelf_life/risk/action, but HAS temp_danger_flag)
 """
 
 import numpy as np
@@ -24,10 +10,7 @@ import pandas as pd
 import joblib
 import os
 from typing import Dict, Any
-
-# ══════════════════════════════════════════════════════════════
-# LOAD MODELS
-# ══════════════════════════════════════════════════════════════
+from collections import OrderedDict
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 _MODELS_DIR = os.path.join(_BASE_DIR, 'models')
@@ -53,15 +36,11 @@ try:
         time_model = risk_model
         action_model = risk_model
     
-    print("[OK] All models loaded successfully!")
+    print("[OK] Models loaded!")
     
 except Exception as e:
-    print(f"[ERROR] Error loading models: {e}")
+    print(f"[ERROR] {e}")
     raise
-
-# ══════════════════════════════════════════════════════════════
-# CONSTANTS
-# ══════════════════════════════════════════════════════════════
 
 RISK_LEVELS = ['Low', 'Medium', 'High', 'Critical']
 
@@ -82,26 +61,37 @@ PRODUCT_SAFE_TEMPS = {
     'vaccines': {'low': 2, 'mid': 4, 'high': 8},
 }
 
-# ══════════════════════════════════════════════════════════════
-# FEATURE ENGINEERING
-# ══════════════════════════════════════════════════════════════
+CATEGORY_ENCODING = {
+    'dairy': 0, 'meat': 1, 'produce': 2, 'seafood': 3, 'pharmaceutical': 4, 'frozen': 5,
+}
+
+PRODUCT_ENCODING = {
+    'milk': 0, 'cheese': 1, 'yogurt': 2, 'butter': 3, 'beef': 4, 'chicken': 5,
+    'pork': 6, 'lamb': 7, 'meat': 1, 'vegetables': 8, 'fruits': 9, 'fish': 10,
+    'shrimp': 11, 'salmon': 12, 'vaccines': 13, 'medicines': 14, 'ice_cream': 15,
+    'frozen_vegetables': 16,
+}
 
 def engineer_features(backend_data: Dict[str, Any]) -> tuple:
-    """Generate features matching scaler's expectations"""
-    
     temperature = float(backend_data.get('avg_temp_c', 5.0))
     humidity = float(backend_data.get('humidity_percent', 70.0))
     exposure_hrs = float(backend_data.get('transport_duration_hr', 12.0))
     product_type = backend_data.get('product_type', 'milk').lower()
     
+    category_map = {
+        'milk': 'dairy', 'cheese': 'dairy', 'yogurt': 'dairy', 'butter': 'dairy',
+        'beef': 'meat', 'chicken': 'meat', 'pork': 'meat', 'lamb': 'meat', 'meat': 'meat',
+        'vegetables': 'produce', 'fruits': 'produce',
+        'fish': 'seafood', 'shrimp': 'seafood', 'salmon': 'seafood',
+        'vaccines': 'pharmaceutical', 'medicines': 'pharmaceutical',
+        'ice_cream': 'frozen', 'frozen_vegetables': 'frozen',
+    }
+    category = category_map.get(product_type, 'dairy')
+    
     safe_temps = PRODUCT_SAFE_TEMPS.get(product_type, PRODUCT_SAFE_TEMPS['milk'])
     safe_temp_low = safe_temps['low']
     safe_temp_mid = safe_temps['mid']
     safe_temp_high = safe_temps['high']
-    
-    humidity_low = 60.0
-    humidity_mid = 75.0
-    humidity_high = 85.0
     
     ethylene_ppm = float(backend_data.get('ethylene_ppm', 5.0))
     co2_ppm = float(backend_data.get('co2_ppm', 500.0))
@@ -110,93 +100,119 @@ def engineer_features(backend_data: Dict[str, Any]) -> tuple:
     
     temp_deviation = temperature - safe_temp_mid
     temp_deviation_degree_hr = temp_deviation * exposure_hrs
-    humidity_deviation = humidity - humidity_mid
+    humidity_deviation = humidity - 75.0
     cumulative_damage_index = abs(temp_deviation_degree_hr) / 100.0
     
-    spoilage_rate_per_hr = max(0, temp_deviation * 0.01) if temp_deviation > 0 else 0
-    spoilage_probability = min(1.0, spoilage_rate_per_hr * exposure_hrs)
+    spoilage_probability = min(1.0, abs(temp_deviation * 0.01) * exposure_hrs)
     remaining_shelf_life_hours = max(0, (1.0 - spoilage_probability) * 100.0)
     
     temp_danger_flag = 1 if temperature > safe_temp_high else 0
     
-    # Create 22 features including action_encoded and risk_encoded for scaler
-    # (scaler was fitted on data that had these columns from step4)
-    features = pd.DataFrame([{
-        'temperature_C': temperature,
-        'humidity_percent': humidity,
-        'safe_temp_low_C': safe_temp_low,
-        'safe_temp_mid_C': safe_temp_mid,
-        'safe_temp_high_C': safe_temp_high,
-        'humidity_low_percent': humidity_low,
-        'humidity_mid_percent': humidity_mid,
-        'humidity_high_percent': humidity_high,
-        'exposure_hours': exposure_hrs,
-        'ethylene_ppm': ethylene_ppm,
-        'co2_ppm': co2_ppm,
-        'nh3_ppm': nh3_ppm,
-        'h2s_ppm': h2s_ppm,
-        'temp_deviation': temp_deviation,
-        'temp_deviation_degree_hr': temp_deviation_degree_hr,
-        'cumulative_damage_index': cumulative_damage_index,
-        'humidity_deviation': humidity_deviation,
-        'spoilage_rate_per_hr': spoilage_rate_per_hr,
-        'spoilage_probability': spoilage_probability,
-        'remaining_shelf_life_hours': remaining_shelf_life_hours,
-        'risk_encoded': 0,      # Placeholder
-        'action_encoded': 0,    # Placeholder
-    }])
+    category_encoded = CATEGORY_ENCODING.get(category, 0)
+    product_name_encoded = PRODUCT_ENCODING.get(product_type, 0)
     
-    # Reorder to match scaler's expected order
-    if hasattr(scaler, 'feature_names_in_'):
-        features = features[scaler.feature_names_in_]
+    # 23 features for SCALER (exact order)
+    features_for_scaler = OrderedDict([
+        ('temperature_C', temperature),
+        ('humidity_percent', humidity),
+        ('safe_temp_low_C', safe_temp_low),
+        ('safe_temp_mid_C', safe_temp_mid),
+        ('safe_temp_high_C', safe_temp_high),
+        ('humidity_low_percent', 60.0),
+        ('humidity_mid_percent', 75.0),
+        ('humidity_high_percent', 85.0),
+        ('exposure_hours', exposure_hrs),
+        ('ethylene_ppm', ethylene_ppm),
+        ('co2_ppm', co2_ppm),
+        ('nh3_ppm', nh3_ppm),
+        ('h2s_ppm', h2s_ppm),
+        ('temp_deviation', temp_deviation),
+        ('temp_deviation_degree_hr', temp_deviation_degree_hr),
+        ('cumulative_damage_index', cumulative_damage_index),
+        ('humidity_deviation', humidity_deviation),
+        ('spoilage_probability', spoilage_probability),
+        ('remaining_shelf_life_hours', remaining_shelf_life_hours),
+        ('category_encoded', category_encoded),
+        ('product_name_encoded', product_name_encoded),
+        ('risk_encoded', 0),
+        ('action_encoded', 0),
+    ])
     
-    return features, temp_danger_flag
-
-
-# ══════════════════════════════════════════════════════════════
-# PREDICTION
-# ══════════════════════════════════════════════════════════════
+    return pd.DataFrame([features_for_scaler]), temp_danger_flag, spoilage_probability, remaining_shelf_life_hours
 
 def predict(features: Dict[str, Any]) -> Dict[str, Any]:
-    """Main prediction function"""
+    # Generate 23 features for scaler
+    X_for_scaler, temp_danger_flag, spoilage_prob, shelf_life = engineer_features(features)
     
-    X_for_scaler, temp_danger_flag = engineer_features(features)
-    
-    # Scale
+    # Scale the 23 features
     X_scaled = scaler.transform(X_for_scaler)
     X_scaled_df = pd.DataFrame(X_scaled, columns=X_for_scaler.columns)
     
-    # Drop action_encoded and risk_encoded (they were only for scaler)
-    X_no_encoded = X_scaled_df.drop(columns=['action_encoded', 'risk_encoded'], errors='ignore')
+    # Create 20 features for RISK MODEL (exact order model expects)
+    model_features = OrderedDict([
+        ('temperature_C', X_scaled_df['temperature_C'].values[0]),
+        ('humidity_percent', X_scaled_df['humidity_percent'].values[0]),
+        ('safe_temp_low_C', X_scaled_df['safe_temp_low_C'].values[0]),
+        ('safe_temp_mid_C', X_scaled_df['safe_temp_mid_C'].values[0]),
+        ('safe_temp_high_C', X_scaled_df['safe_temp_high_C'].values[0]),
+        ('humidity_low_percent', X_scaled_df['humidity_low_percent'].values[0]),
+        ('humidity_mid_percent', X_scaled_df['humidity_mid_percent'].values[0]),
+        ('humidity_high_percent', X_scaled_df['humidity_high_percent'].values[0]),
+        ('exposure_hours', X_scaled_df['exposure_hours'].values[0]),
+        ('ethylene_ppm', X_scaled_df['ethylene_ppm'].values[0]),
+        ('co2_ppm', X_scaled_df['co2_ppm'].values[0]),
+        ('nh3_ppm', X_scaled_df['nh3_ppm'].values[0]),
+        ('h2s_ppm', X_scaled_df['h2s_ppm'].values[0]),
+        ('temp_deviation', X_scaled_df['temp_deviation'].values[0]),
+        ('temp_deviation_degree_hr', X_scaled_df['temp_deviation_degree_hr'].values[0]),
+        ('cumulative_damage_index', X_scaled_df['cumulative_damage_index'].values[0]),
+        ('humidity_deviation', X_scaled_df['humidity_deviation'].values[0]),
+        ('temp_danger_flag', temp_danger_flag),  # NOT SCALED!
+        ('category_encoded', X_scaled_df['category_encoded'].values[0]),
+        ('product_name_encoded', X_scaled_df['product_name_encoded'].values[0]),
+    ])
     
-    # Insert temp_danger_flag at position 18 for model
-    model_features = pd.DataFrame()
-    
-    # First 17 columns
-    for col in list(X_no_encoded.columns[:17]):
-        model_features[col] = X_no_encoded[col]
-    
-    # Insert temp_danger_flag
-    model_features['temp_danger_flag'] = [temp_danger_flag]
-    
-    # Remaining columns
-    for col in list(X_no_encoded.columns[17:]):
-        model_features[col] = X_no_encoded[col]
+    model_input = pd.DataFrame([model_features])
     
     # Predict
-    risk_idx = int(risk_model.predict(model_features)[0])
-    risk_probs = risk_model.predict_proba(model_features)[0]
+    risk_prediction = risk_model.predict(model_input)[0]
     
-    quality_remaining = (1.0 - X_for_scaler['spoilage_probability'].values[0]) * 100.0
-    hours_to_spoilage = X_for_scaler['remaining_shelf_life_hours'].values[0]
+    # Model returns string labels, not indices
+    if isinstance(risk_prediction, str):
+        risk_level = risk_prediction
+        risk_idx = RISK_LEVELS.index(risk_level) if risk_level in RISK_LEVELS else 0
+    else:
+        risk_idx = int(risk_prediction)
+        risk_idx = max(0, min(3, risk_idx))
+        risk_level = RISK_LEVELS[risk_idx]
+    
+    risk_probs = risk_model.predict_proba(model_input)[0]
+    
+    quality_remaining = (1.0 - spoilage_prob) * 100.0
+    hours_to_spoilage = shelf_life
+    
+    # ⚠️ QUALITY-BASED RISK ADJUSTMENT (Risk inversely proportional to quality)
+    # If quality is critically low, risk MUST be elevated!
+    if quality_remaining < 10:
+        # Quality < 10% → CRITICAL risk
+        risk_idx = max(risk_idx, 3)
+        risk_level = 'Critical'
+    elif quality_remaining < 30:
+        # Quality < 30% → HIGH risk
+        risk_idx = max(risk_idx, 2)
+        risk_level = 'High'
+    elif quality_remaining < 50:
+        # Quality < 50% → MEDIUM risk
+        risk_idx = max(risk_idx, 1)
+        risk_level = 'Medium'
+    # If quality > 50%, keep the model's risk prediction
     
     action_idx = min(risk_idx, 3)
-    risk_idx = max(0, min(3, risk_idx))
     quality_remaining = max(0.0, min(100.0, quality_remaining))
     
     return {
         'quality_remaining': round(quality_remaining, 1),
-        'risk_level': RISK_LEVELS[risk_idx],
+        'risk_level': risk_level,
         'risk_index': risk_idx,
         'hours_to_spoilage': round(max(0, hours_to_spoilage), 1),
         'recommended_action': ACTION_MAP.get(action_idx, ACTION_MAP[0]),
@@ -208,21 +224,10 @@ def predict(features: Dict[str, Any]) -> Dict[str, Any]:
         }
     }
 
-
 if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("TESTING PREDICTION")
-    print("="*60)
-    
-    test_data = {
-        'avg_temp_c': 5.0,
-        'humidity_percent': 70.0,
-        'transport_duration_hr': 12.0,
-        'product_type': 'milk'
-    }
-    
-    result = predict(test_data)
-    print("\nPrediction successful!")
+    test = {'avg_temp_c': 5.0, 'humidity_percent': 70.0, 'transport_duration_hr': 12.0, 'product_type': 'milk'}
+    result = predict(test)
+    print("\n✅ Prediction successful!")
     for k, v in result.items():
         if k != 'risk_probabilities':
             print(f"  {k}: {v}")
